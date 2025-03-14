@@ -88,9 +88,9 @@ def get_census_legislative_districts(lat, lng):
     params = {
         "x": lng,
         "y": lat,
-        "benchmark": "Public_AR_Census2020",
-        "vintage": "Census2020_Census2020",
-        "layers": "56,58",  # 54 = SD, 58 = HD
+        "benchmark": "Public_AR_Current",
+        "vintage": "Current_Current",
+        "layers": "54,55",  # 54 = SD, 55 = HD
         "format": "json",
     }
 
