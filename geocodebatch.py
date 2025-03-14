@@ -90,7 +90,7 @@ def get_census_legislative_districts(lat, lng):
         "y": lat,
         "benchmark": "Public_AR_Current",
         "vintage": "Current_Current",
-        "layers": "54,55",  # 54 = SD, 55 = HD
+#        "layers": "50,54",  # 50 = SD, 54 = HD -- skip for now
         "format": "json",
     }
 
@@ -101,17 +101,27 @@ def get_census_legislative_districts(lat, lng):
     state_house = None
     state_code = None
 
-    # Check for HD - this contains both districts & state
+    # Extract state code from the 'States' layer if available
     if "result" in data and "geographies" in data["result"]:
-        if "State Legislative Districts - Lower" in data["result"]["geographies"]:
-            house_info = data["result"]["geographies"]["State Legislative Districts - Lower"][0]
+        geographies = data["result"]["geographies"]
 
-            state_code = house_info.get("STATE")
+        if "States" in geographies:
+            state_info = geographies["States"][0]
+            state_code = str(state_info.get("STATE"))
 
-            state_house = house_info["BASENAME"]
+        # Dynamically find the correct keys for legislative districts
+        house_key = next((key for key in geographies if "State Legislative Districts - Lower" in key), None)
+        senate_key = next((key for key in geographies if "State Legislative Districts - Upper" in key), None)
 
-            # Senate District (derived from House District by stripping last character)
-            state_senate = "".join(filter(str.isdigit, house_info["BASENAME"]))
+        # Extract House District
+        if house_key and geographies.get(house_key):
+            house_info = geographies[house_key][0]
+            state_house = house_info.get("BASENAME")
+
+        # Extract Senate District
+        if senate_key and geographies.get(senate_key):
+            senate_info = geographies[senate_key][0]
+            state_senate = senate_info.get("BASENAME")
 
     if state_code != "27":
         state_senate = "Not Minnesota"
