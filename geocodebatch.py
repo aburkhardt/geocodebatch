@@ -4,6 +4,7 @@ import time
 import math
 import pprint
 import json
+import re
 
 import pandas as pd
 import requests
@@ -19,6 +20,12 @@ AZURE_API_VERSION = "1.0"
 if not AZURE_MAPS_KEY:
     print("Error: Please set AZURE_MAPS_KEY in your environment.")
     # sys.exit(1)
+
+RATE_LIMIT_SLEEP = 0.12
+AZURE_TIMEOUT = 8
+AZURE_MAX_RETRIES = 2
+CENSUS_TIMEOUT = 8
+LOG_EVERY = 50
 
 #------------------ FILE HANDLING -------------------------------
 def get_input_filename():
@@ -141,7 +148,7 @@ def get_census_legislative_districts(lat, lng):
         "state_house_district": state_house,
     }
 
-def _azure_search_address(address, session=None, max_retries=5):
+def _azure_search_address(address, session=None, max_retries=AZURE_MAX_RETRIES):
     """
     Call Azure Maps Search Address API with retry/backoff.
     Returns first result dict or None.
@@ -154,71 +161,45 @@ def _azure_search_address(address, session=None, max_retries=5):
         "countrySet": "US",
     }
 
-    for attempt in range(max_retries):
+    for attempt in range(max_retries + 1):
         try:
-            resp = sess.get(AZURE_BASE_URL, params=params, timeout=20)
-            status = resp.status_code
+            resp = sess.get(AZURE_BASE_URL, params=params, timeout=AZURE_TIMEOUT)
 
-            if status == 200:
+            if resp.status_code == 200:
                 payload = resp.json()
                 results = payload.get("results") or []
+                time.sleep(RATE_LIMIT_SLEEP)
                 return results[0] if results else None
-
-            if status in (429, 500, 502, 503, 504):
-                sleep_for = BACKOFF_TIME * (2 ** attempt)  # exponential backoff
-                print(f"[Azure] {status} throttled/server error. Retrying in {sleep_for:.1f}s...")
-                time.sleep(sleep_for)
+            
+            if resp.status_code == 429:
+                time.sleep(1.0 + attempt * 0.5)
                 continue
 
-            # Other 4xx: likely bad request or quota issues; don't retry forever
-            print(f"[Azure] Non-retryable HTTP {status}: {resp.text[:200]}")
+            if resp.status_code in (500, 502, 503, 504):
+                time.sleep(1.0 + attempt * 0.5)
+                continue
+
+            print(f"[Azure] Non-retryable HTTP {resp.status_code}: {resp.text[:200]}")
             return None
 
         except requests.RequestException as e:
-            sleep_for = BACKOFF_TIME * (2 ** attempt)
-            print(f"[Azure] Request error: {e}. Retrying in {sleep_for:.1f}s...")
-            time.sleep(sleep_for)
-
-    print("[Azure] Max retries reached; skipping this address.")
+            time.sleep(1.0 + attempt * 0.5)
+    print("[Azure] giving up on this address.")
     return None
 
-def get_results(address, session=None):
-    """
-    Geocode an address using Azure Maps Search API and get state legislative districts.
-    Returns a dict matching your original column names.
-    """
-    result = _azure_search_address(address, session=session)
+cache = {}
 
-    if result:
-        try:
-            pos = result.get("position") or {}
-            lat = pos.get("lat")
-            lng = pos.get("lon")
+def _normalize_address(s: str) -> str:
+    if s is None:
+        return ""
+    # strip apt/unit/suite for geocoding; tweak as you like
+    s = str(s).strip()
+    s = re.sub(r'\s+(Apt|Apartment|Unit|Suite|Ste|#)\s*[\w\-]+', '', s, flags=re.IGNORECASE)
+    # collapse spaces & lowercase
+    s = re.sub(r'\s+', ' ', s).strip().lower()
+    return s
 
-            district_data = get_census_legislative_districts(lat, lng) if (lat is not None and lng is not None) else {
-                "state_senate_district": None, "state_house_district": None
-            }
-
-            addr = result.get("address") or {}
-            return {
-                "formatted_address": addr.get("freeformAddress"),
-                "latitude": lat,
-                "longitude": lng,
-                "state": addr.get("countrySubdivision"),
-                "county": addr.get("countrySecondarySubdivision"),
-                "city": addr.get("municipality"),
-                "postal_code": addr.get("postalCode"),
-                "country": addr.get("country"),
-                "confidence": result.get("score"),
-                "state_senate_district": district_data["state_senate_district"],
-                "state_house_district": district_data["state_house_district"],
-                "input_string": address,
-            }
-        
-        except Exception as e:
-            print(f"[Azure] Parse error for '{address}': {e}")
-
-    # Fallthrough: return empty row if no result or error
+def _empty_row(address):
     return {
         "formatted_address": None,
         "latitude": None,
@@ -233,6 +214,61 @@ def get_results(address, session=None):
         "state_house_district": None,
         "input_string": address,
     }
+
+def get_results(address, session=None):
+    """
+    Geocode an address using Azure Maps Search API and get state legislative districts.
+    Always returns a dict; caches successes and failures.
+    """
+    key = _normalize_address(address)
+
+    if key in ("", "nan", "none"):
+        row = _empty_row(address)
+        cache[key] = row
+        return row
+    
+    if key in cache:
+        return cache[key]
+    
+    result = _azure_search_address(address, session=session)
+
+    if result:
+        try:
+            pos = result.get("position") or {}
+            lat = pos.get("lat")
+            lng = pos.get("lon")
+
+            addr = result.get("address") or {}
+            country = addr.get("country")
+            state   = addr.get("countrySubdivision")
+
+            if country == "US" and state == "MN" and lat is not None and lng is not None:
+                district_data = get_census_legislative_districts(lat, lng)
+            else:
+                district_data = {"state_senate_district": None, "state_house_district": None}
+
+            row = {
+                "formatted_address": addr.get("freeformAddress"),
+                "latitude": lat,
+                "longitude": lng,
+                "state": state,
+                "county": addr.get("countrySecondarySubdivision"),
+                "city": addr.get("municipality"),
+                "postal_code": addr.get("postalCode"),
+                "confidence": result.get("score"),
+                "state_senate_district": district_data["state_senate_district"],
+                "state_house_district": district_data["state_house_district"],
+                "input_string": address,
+            }
+        
+        except Exception as e:
+            print(f"[Azure] Parse error for '{address}': {e}")
+            row = _empty_row(address)
+    else:
+        row = _empty_row(address)
+    
+    cache[key] = row
+    return row
 
 # ------------------ MAIN EXECUTION -----------------------------
 def main():
@@ -254,27 +290,25 @@ def main():
     
     results = []
     session = requests.Session()
-    for index, address in enumerate(addresses):
-        try:
-            if address is None or str(address).strip() == "" or str(address).lower() == "nan":
-                results.append({
-                    "formatted_address": None, "latitude": None, "longitude": None,
-                    "state": None, "county": None, "city": None, "postal_code": None, "country": None,
-                    "confidence": None, "state_senate_district": None, "state_house_district": None,
-                    "input_string": address
-                })
-                continue
-            result = get_results(address, session=session)
-            results.append(result)
+    for i, address in enumerate(addresses, 1):
+        if i % LOG_EVERY == 0:
+            print(f"[{i}/{len(addresses)}] last: {address!r}")
 
+        try:
+            res = get_results(address, session=session)
         except Exception as e:
-            print(f"Error processing address '{address}': {e}")
-            results.append({
-                "formatted_address": None, "latitude": None, "longitude": None,
-                "state": None, "county": None, "city": None, "postal_code": None, "country": None,
-                "confidence": None, "state_senate_district": None, "state_house_district": None,
-                "input_string": address
-            })
+            res = {"formatted_address": None, "latitude": None, "longitude": None,
+                "state": None, "county": None, "city": None, "postal_code": None,
+                "country": None, "confidence": None,
+                "state_senate_district": None, "state_house_district": None,
+                "input_string": address}
+        results.append(res)
+
+        if i % 1000 == 0:
+            tmp_out = output_filename.replace(".csv", f".part_{i}.csv")
+            save_results(results, tmp_out, data.iloc[:i])
+            print("1000 rows saved.")
+
     print(f"Saving {len(results)} results to {output_filename}")
 
     save_results(results, output_filename, data)
